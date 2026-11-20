@@ -1,10 +1,10 @@
-# app.py — All-in-One API (RC Mobile + E-Challan + Proxy Rotation) for Render.com
-import os, sys, json, time, re, threading, logging, random
+# app.py — All-in-One API (RC Mobile + E-Challan) — No Proxy, Render-ready
+import os, sys, json, time, re, threading, logging
 from collections import defaultdict
 from datetime import datetime
 from functools import wraps
 from base64 import b64decode, b64encode
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any
 
 import requests
 import pyaes
@@ -76,125 +76,6 @@ class SimpleCache:
 mobile_cache = SimpleCache()
 
 # ═══════════════════════════════════════════════════════════════
-#  PROXY MANAGER (background fetch + rotation)
-# ═══════════════════════════════════════════════════════════════
-class ProxyManager:
-    PROXY_URLS = [
-        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
-        "https://api.proxyscrape.com/v4/free-proxy-list/get?request=displayproxies&protocol=http&timeout=5000",
-        "https://api.proxyscrape.com/?request=displayproxies&proxytype=http",
-        "https://www.proxy-list.download/api/v1/get?type=http",
-        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt",
-        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
-        "https://raw.githubusercontent.com/opsxcq/proxy-list/master/list.txt",
-        "https://raw.githubusercontent.com/almighty-uncle/Proxy-List/main/HTTP.txt",
-        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-    ]
-    REFRESH_INTERVAL = 120  # seconds
-
-    def __init__(self):
-        self._proxies: List[str] = []
-        self._lock = threading.Lock()
-        self._last_refresh = 0
-        self._idx = 0
-        t = threading.Thread(target=self._loop, daemon=True)
-        t.start()
-
-    def _loop(self):
-        while True:
-            try:
-                self._refresh()
-            except Exception as e:
-                logger.warning(f"Proxy refresh failed: {e}")
-            time.sleep(self.REFRESH_INTERVAL)
-
-    def _fetch_parallel(self):
-        """Simple threaded fetch — 3s hard cap per URL."""
-        results: List[str] = []
-        lock = threading.Lock()
-
-        def worker(url):
-            try:
-                r = requests.get(url, timeout=3, verify=False,
-                                 headers={"User-Agent": "Mozilla/5.0"})
-                if r.status_code != 200 or not r.text:
-                    return
-                local = []
-                text = r.text.replace(",", "\n")
-                # JSON attempt
-                if text.strip().startswith(("{", "[")):
-                    try:
-                        j = r.json()
-                        if isinstance(j, dict):
-                            if "proxy" in j:
-                                local.append(j["proxy"])
-                            if "data" in j and isinstance(j["data"], list):
-                                for it in j["data"]:
-                                    if isinstance(it, dict) and "ip" in it and "port" in it:
-                                        local.append(f"{it['ip']}:{it['port']}")
-                            if "proxies" in j and isinstance(j["proxies"], list):
-                                local.extend(j["proxies"])
-                        elif isinstance(j, list):
-                            for it in j:
-                                if isinstance(it, dict) and "ip" in it and "port" in it:
-                                    local.append(f"{it['ip']}:{it['port']}")
-                    except Exception:
-                        pass
-                # Regex fallback (covers TXT + HTML)
-                for m in re.finditer(r'\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b', r.text):
-                    local.append(m.group(0))
-                with lock:
-                    results.extend(local)
-            except Exception:
-                pass
-
-        threads = [threading.Thread(target=worker, args=(u,), daemon=True)
-                   for u in self.PROXY_URLS]
-        for t in threads: t.start()
-        for t in threads: t.join(timeout=4)
-
-        # Validate + dedupe
-        clean = []
-        seen = set()
-        for p in results:
-            p = p.strip()
-            if p in seen:
-                continue
-            seen.add(p)
-            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{2,5}$', p):
-                clean.append(p)
-        return clean
-
-    def _refresh(self):
-        logger.info("Refreshing proxy pool...")
-        fresh = self._fetch_parallel()
-        if fresh:
-            with self._lock:
-                self._proxies = fresh
-                self._last_refresh = time.time()
-            logger.info(f"Proxy pool updated: {len(fresh)} proxies")
-        else:
-            logger.warning("Proxy refresh returned 0 — keeping old pool")
-
-    def get(self) -> Optional[str]:
-        with self._lock:
-            if not self._proxies:
-                return None
-            self._idx = (self._idx + 1) % len(self._proxies)
-            return self._proxies[self._idx]
-
-    def stats(self) -> Dict[str, Any]:
-        with self._lock:
-            return {
-                "count": len(self._proxies),
-                "last_refresh_ago_sec": round(time.time() - self._last_refresh, 1)
-                if self._last_refresh else None,
-            }
-
-
-proxy_mgr = ProxyManager()
-
-# ═══════════════════════════════════════════════════════════════
 #  RATE LIMIT (shared)
 # ═══════════════════════════════════════════════════════════════
 ip_requests = defaultdict(list)
@@ -260,49 +141,35 @@ def valid_reg(n):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  HTTP HELPER with proxy rotation + retry
+#  HTTP HELPER (direct + retry, NO PROXY)
 # ═══════════════════════════════════════════════════════════════
 def http_request(method, url, *, headers=None, json_body=None, data=None,
-                 timeout=30, allow_proxy=True, max_retries=3):
+                 timeout=30, max_retries=3):
     """
-    Try direct → proxy rotation with retries.
-    Returns (response_or_None, error_str_or_None, used_proxy_or_None)
+    Direct request with retry on connection errors.
+    Returns (response_or_None, error_str_or_None)
     """
     last_err = None
-
-    # 1) Direct attempt first (fastest)
-    try:
-        r = requests.request(method, url, headers=headers, json=json_body,
-                             data=data, timeout=timeout)
-        r.raise_for_status()
-        return r, None, None
-    except Exception as e:
-        last_err = f"direct: {e}"
-
-    if not allow_proxy:
-        return None, last_err, None
-
-    # 2) Proxy rotation
-    for _ in range(max_retries):
-        proxy = proxy_mgr.get()
-        if not proxy:
-            break
+    for attempt in range(max_retries):
         try:
-            r = requests.request(method, url, headers=headers, json=json_body,
-                                 data=data, timeout=timeout,
-                                 proxies={"http": f"http://{proxy}",
-                                          "https": f"http://{proxy}"})
+            r = requests.request(
+                method, url, headers=headers, json=json_body,
+                data=data, timeout=timeout,
+                # Force fresh TCP connection
+                # (Connection: close header already set)
+            )
             r.raise_for_status()
-            return r, None, proxy
+            return r, None
         except Exception as e:
-            last_err = f"proxy {proxy}: {e}"
-            continue
-
-    return None, last_err, None
+            last_err = str(e)
+            logger.warning(f"Attempt {attempt+1}/{max_retries} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))  # 0.5s, 1s backoff
+    return None, last_err
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CHASSIS (RenewBuy → SMC) — uses http_request (proxy aware)
+#  CHASSIS (RenewBuy → SMC)
 # ═══════════════════════════════════════════════════════════════
 UPSTREAM_TIMEOUT = 60
 RENEWBUY_URL = "https://apex.renewbuyinsurance.com/api/v1/vaahan/registration_number/"
@@ -322,47 +189,36 @@ SMC_HEADERS = {
 def renewbuy_chassis(number):
     params = {"regn_no": number, "partner_code": "",
               "mobile_no": "7451010349", "source": "apex", "originData": "false"}
-    r, err, _ = http_request("GET", RENEWBUY_URL, headers=None,
-                             timeout=UPSTREAM_TIMEOUT)
-    # Note: params in URL
-    if r is None:
-        # rebuild with params via direct requests
-        try:
-            r2 = requests.get(RENEWBUY_URL, params=params, timeout=UPSTREAM_TIMEOUT)
-            if r2.status_code != 200:
+    try:
+        r = requests.get(RENEWBUY_URL, params=params, timeout=UPSTREAM_TIMEOUT)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if isinstance(data, dict):
+            if "code" in data and data.get("code") not in [200, 0, None]:
                 return None
-            data = r2.json()
-        except Exception:
-            return None
-    else:
-        try:
-            data = r.json()
-        except Exception:
-            return None
-    if isinstance(data, dict):
-        if "code" in data and data.get("code") not in [200, 0, None]:
-            return None
-        ch = data.get("chassis_number", "")
-        if not ch:
-            md = data.get("meta_data", {})
-            if isinstance(md, dict):
-                sr = md.get("signzy_response", {})
-                if isinstance(sr, dict):
-                    rr = sr.get("result", {})
-                    if isinstance(rr, dict):
-                        ch = rr.get("chassis", "")
-        if not ch:
-            vd = data.get("vehicle_details", {})
-            if isinstance(vd, dict):
-                ch = vd.get("chassis_no", "")
-        return ch or None
-    return None
+            ch = data.get("chassis_number", "")
+            if not ch:
+                md = data.get("meta_data", {})
+                if isinstance(md, dict):
+                    sr = md.get("signzy_response", {})
+                    if isinstance(sr, dict):
+                        rr = sr.get("result", {})
+                        if isinstance(rr, dict):
+                            ch = rr.get("chassis", "")
+            if not ch:
+                vd = data.get("vehicle_details", {})
+                if isinstance(vd, dict):
+                    ch = vd.get("chassis_no", "")
+            return ch or None
+    except Exception:
+        return None
 
 
 def smc_chassis(number):
     payload = {"URL": "GetVaahanDetailsByVehicleNo", "Props": [number], "Token": ""}
-    r, err, _ = http_request("POST", SMC_API_URL, headers=SMC_HEADERS,
-                             json_body=payload, timeout=UPSTREAM_TIMEOUT)
+    r, err = http_request("POST", SMC_API_URL, headers=SMC_HEADERS,
+                          json_body=payload, timeout=UPSTREAM_TIMEOUT)
     if r is None:
         return None
     try:
@@ -383,7 +239,7 @@ def get_chassis(number):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PARIVAHAN MOBILE SCRAPE (unchanged logic, best-effort)
+#  PARIVAHAN MOBILE SCRAPE
 # ═══════════════════════════════════════════════════════════════
 HOMEPAGE_URL = ("https://vahan.parivahan.gov.in/vahanservice/vahan/ui/"
                 "statevalidation/homepage.xhtml?statecd="
@@ -572,14 +428,14 @@ def fetch_mobile_parivahan(vehicle_number, chassis_last_5, fallback_mobile=""):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  E-CHALLAN (AES ECB) — proxy aware
+#  E-CHALLAN (AES ECB)
 # ═══════════════════════════════════════════════════════════════
 AES_KEY = b"eECHALLAN@JSON$#"
 CHALLAN_BASE_URL = "https://echallan.parivahan.gov.in/api/get-rc-offence-info"
 
 CHALLAN_HEADERS = {
     "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 15; 23124RN87I Build/AP3A.240905.015.A2)",
-    "Connection": "close",   # <-- important: avoid stale keep-alive
+    "Connection": "close",   # important: avoid stale keep-alive
     "Accept": "application/json",
     "Accept-Encoding": "gzip",
     "Content-Type": "application/json",
@@ -628,9 +484,9 @@ def search_vehicle(reg_no: str, **overrides) -> Dict[str, Any]:
     payload = {**DEFAULT_PAYLOAD, "reg_no": reg_no, **overrides}
     body = json.dumps(payload)
 
-    r, err, used_proxy = http_request(
+    r, err = http_request(
         "POST", CHALLAN_BASE_URL, headers=CHALLAN_HEADERS,
-        data=body, timeout=30, allow_proxy=True, max_retries=3
+        data=body, timeout=30, max_retries=3
     )
 
     if r is None:
@@ -672,7 +528,6 @@ def search_vehicle(reg_no: str, **overrides) -> Dict[str, Any]:
         "vehicle_details": vehicle_details,
         "challan_details": challan_details,
         "error": None,
-        "_proxy_used": used_proxy,
     }
 
 
@@ -683,13 +538,11 @@ def search_vehicle(reg_no: str, **overrides) -> Dict[str, Any]:
 def home():
     return jsonify({
         "success": True,
-        "message": "🚗 All-in-One API — RC Mobile + E-Challan + Proxy Rotation",
+        "message": "🚗 All-in-One API — RC Mobile + E-Challan",
         "endpoints": {
             "/rc4?number=MH12AB1234": "RC → Mobile number",
             "/challan?number=MH46BV8300": "RC → Vehicle + Challan details",
             "/challan/bulk": "POST {numbers:[...]} max 5",
-            "/proxy/stats": "Proxy pool stats",
-            "/proxy/refresh": "POST — force refresh proxy pool",
             "/health": "Health check",
             "/cache/clear": "POST — clear caches",
         },
@@ -704,24 +557,12 @@ def health():
         "timestamp": datetime.now().isoformat(),
         "mobile_cache_size": len(mobile_cache),
         "deps": {"bs4": HAS_BS4, "retry": HAS_RETRY},
-        "proxies": proxy_mgr.stats(),
         "rate_limits": {
             "max_per_min": MAX_REQ_MIN,
             "max_per_5min": MAX_REQ_5MIN,
             "block_hours": BLOCK_HOURS,
         },
     })
-
-
-@app.route("/proxy/stats", methods=["GET"])
-def proxy_stats():
-    return jsonify({"success": True, **proxy_mgr.stats()})
-
-
-@app.route("/proxy/refresh", methods=["POST"])
-def proxy_refresh():
-    proxy_mgr._refresh()
-    return jsonify({"success": True, **proxy_mgr.stats()})
 
 
 # ---------- RC → Mobile ----------
@@ -859,10 +700,9 @@ def clear_cache():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     print("=" * 60)
-    print("  🚗 All-in-One API — RC Mobile + E-Challan + Proxy")
+    print("  🚗 All-in-One API — RC Mobile + E-Challan (No Proxy)")
     print(f"  http://0.0.0.0:{port}/")
     print(f"  /rc4?number=MH12AB1234")
     print(f"  /challan?number=MH46BV8300")
-    print(f"  /proxy/stats")
     print("=" * 60)
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
