@@ -1,13 +1,16 @@
-# api/index.py — Vercel All-in-One (RC Mobile + E-Challan via Cloudflare Worker)
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+# app.py — All-in-One API (RC Mobile + E-Challan) — Direct, No Worker
 import os, json, time, re, threading, logging
 from collections import defaultdict
 from datetime import datetime
+from functools import wraps
 from base64 import b64decode, b64encode
+from typing import Dict, Any
 
 import requests
 import pyaes
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_caching import Cache
 
 try:
     from bs4 import BeautifulSoup
@@ -15,20 +18,30 @@ try:
 except ImportError:
     HAS_BS4 = False
 
-logging.basicConfig(level=logging.INFO)
+try:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    HAS_RETRY = True
+except ImportError:
+    HAS_RETRY = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════
-#  CONFIG
+#  APP + CACHE
 # ═══════════════════════════════════════════════════════════════
-CLOUDFLARE_WORKER_URL = os.getenv(
-    "CLOUDFLARE_WORKER_URL",
-    "https://echallan-proxy.your-name.workers.dev"
-)
+app = Flask(__name__)
+app.config['JSON_AS_ASCII'] = False
+app.config['CACHE_TYPE'] = 'SimpleCache'
+app.config['CACHE_DEFAULT_TIMEOUT'] = 1800
+CORS(app)
+cache = Cache(app)
 
-# ═══════════════════════════════════════════════════════════════
-#  CACHE
-# ═══════════════════════════════════════════════════════════════
+
 class SimpleCache:
     def __init__(self, maxsize=500, default_timeout=3600):
         self._d = {}
@@ -58,8 +71,11 @@ class SimpleCache:
         with self._lock:
             self._d.clear()
 
+    def __len__(self):
+        with self._lock:
+            return len(self._d)
 
-cache = SimpleCache()
+
 mobile_cache = SimpleCache()
 
 # ═══════════════════════════════════════════════════════════════
@@ -74,27 +90,40 @@ WIN_1MIN = 60
 WIN_5MIN = 300
 
 
-def check_rate_limit(ip):
-    now = time.time()
-    if ip in blocked_ips:
-        until = blocked_ips[ip]
-        if now < until:
-            return {"success": False, "error": "IP blocked",
-                    "unblock_at": datetime.fromtimestamp(until).isoformat()}
-        del blocked_ips[ip]
-        ip_requests.pop(ip, None)
-    ip_requests[ip] = [t for t in ip_requests.get(ip, []) if now - t <= WIN_5MIN]
-    if len(ip_requests[ip]) >= MAX_REQ_5MIN:
-        blocked_ips[ip] = now + BLOCK_HOURS * 3600
-        return {"success": False,
-                "error": f"Max {MAX_REQ_5MIN}/5min. Blocked {BLOCK_HOURS}h."}
-    one_min = len([t for t in ip_requests[ip] if now - t <= WIN_1MIN])
-    if one_min >= MAX_REQ_MIN:
-        blocked_ips[ip] = now + BLOCK_HOURS * 3600
-        return {"success": False,
-                "error": f"Max {MAX_REQ_MIN}/min. Blocked {BLOCK_HOURS}h."}
-    ip_requests[ip].append(now)
-    return None
+def _get_ip():
+    ip = request.remote_addr or "unknown"
+    if request.headers.get("X-Forwarded-For"):
+        ip = request.headers["X-Forwarded-For"].split(",")[0].strip()
+    return ip
+
+
+def rate_limit(f):
+    @wraps(f)
+    def wrapper(*a, **kw):
+        ip = _get_ip()
+        now = time.time()
+        if ip in blocked_ips:
+            until = blocked_ips[ip]
+            if now < until:
+                return jsonify({
+                    "success": False, "error": "IP blocked",
+                    "unblock_at": datetime.fromtimestamp(until).isoformat(),
+                }), 429
+            del blocked_ips[ip]
+            ip_requests.pop(ip, None)
+        ip_requests[ip] = [t for t in ip_requests.get(ip, []) if now - t <= WIN_5MIN]
+        if len(ip_requests[ip]) >= MAX_REQ_5MIN:
+            blocked_ips[ip] = now + BLOCK_HOURS * 3600
+            return jsonify({"success": False,
+                            "error": f"Max {MAX_REQ_5MIN}/5min. Blocked {BLOCK_HOURS}h."}), 429
+        one_min = len([t for t in ip_requests[ip] if now - t <= WIN_1MIN])
+        if one_min >= MAX_REQ_MIN:
+            blocked_ips[ip] = now + BLOCK_HOURS * 3600
+            return jsonify({"success": False,
+                            "error": f"Max {MAX_REQ_MIN}/min. Blocked {BLOCK_HOURS}h."}), 429
+        ip_requests[ip].append(now)
+        return f(*a, **kw)
+    return wrapper
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -115,29 +144,25 @@ def valid_reg(n):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  HTTP HELPER
+#  HTTP HELPER (Direct, no proxy)
 # ═══════════════════════════════════════════════════════════════
-def http_request_worker(method, url, *, headers=None, data=None,
-                        timeout=30, max_retries=3):
+def http_post(url, *, headers=None, data=None, timeout=30, max_retries=3):
     last_err = None
     for attempt in range(max_retries):
         try:
-            r = requests.request(
-                method, CLOUDFLARE_WORKER_URL,
-                headers=headers, data=data, timeout=timeout
-            )
+            r = requests.post(url, headers=headers, data=data, timeout=timeout)
             r.raise_for_status()
             return r, None
         except Exception as e:
             last_err = str(e)
-            logger.warning(f"Worker attempt {attempt+1}/{max_retries} failed: {e}")
+            logger.warning(f"POST {url} attempt {attempt+1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
                 time.sleep(0.5 * (attempt + 1))
     return None, last_err
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CHASSIS
+#  CHASSIS (RenewBuy → SMC)
 # ═══════════════════════════════════════════════════════════════
 UPSTREAM_TIMEOUT = 60
 RENEWBUY_URL = "https://apex.renewbuyinsurance.com/api/v1/vaahan/registration_number/"
@@ -221,6 +246,11 @@ FORM_URL = ("https://vahan.parivahan.gov.in/vahanservice/vahan/ui/"
 
 def create_session():
     s = requests.Session()
+    if HAS_RETRY:
+        retry = Retry(total=1, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -380,8 +410,8 @@ def fetch_mobile_parivahan(vehicle_number, chassis_last_5, fallback_mobile=""):
             fb = re.findall(r"\b[6-9]\d{9}\b", txt)
             if fb:
                 return {"success": True, "mobile_number": fb[0]}
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"mobile scrape attempt {attempt+1} failed: {e}")
         if attempt == 0:
             time.sleep(2)
 
@@ -391,9 +421,10 @@ def fetch_mobile_parivahan(vehicle_number, chassis_last_5, fallback_mobile=""):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  E-CHALLAN (AES ECB)
+#  E-CHALLAN (AES ECB) — DIRECT, no worker
 # ═══════════════════════════════════════════════════════════════
 AES_KEY = b"eECHALLAN@JSON$#"
+CHALLAN_BASE_URL = "https://echallan.parivahan.gov.in/api/get-rc-offence-info"
 
 CHALLAN_HEADERS = {
     "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 15; 23124RN87I Build/AP3A.240905.015.A2)",
@@ -442,12 +473,12 @@ def aes_ecb_encrypt(plaintext: str) -> str:
     return b64encode(encrypted).decode("utf-8")
 
 
-def search_vehicle(reg_no: str, **overrides) -> dict:
+def search_vehicle(reg_no: str, **overrides) -> Dict[str, Any]:
     payload = {**DEFAULT_PAYLOAD, "reg_no": reg_no, **overrides}
     body = json.dumps(payload)
 
-    r, err = http_request_worker(
-        "POST", CLOUDFLARE_WORKER_URL,
+    r, err = http_post(
+        CHALLAN_BASE_URL,
         headers=CHALLAN_HEADERS, data=body, timeout=30, max_retries=3
     )
 
@@ -494,210 +525,174 @@ def search_vehicle(reg_no: str, **overrides) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  VERCEL HANDLER
+#  ROUTES
 # ═══════════════════════════════════════════════════════════════
-class handler(BaseHTTPRequestHandler):
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "success": True,
+        "message": "🚗 All-in-One API — RC Mobile + E-Challan (Direct)",
+        "endpoints": {
+            "/rc4?number=MH12AB1234": "RC → Mobile number",
+            "/challan?number=MH46BV8300": "RC → Vehicle + Challan details",
+            "/challan/bulk": "POST {numbers:[...]} max 5",
+            "/challan/encrypt?text=hello": "AES encrypt (debug)",
+            "/challan/decrypt?text=BASE64": "AES decrypt (debug)",
+            "/health": "Health check",
+            "/cache/clear": "POST — clear caches",
+        },
+    })
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        qs = parse_qs(parsed.query)
 
-        # Client IP
-        ip = self.headers.get("x-forwarded-for", "").split(",")[0].strip() \
-             or self.client_address[0]
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "mobile_cache_size": len(mobile_cache),
+        "deps": {"bs4": HAS_BS4, "retry": HAS_RETRY},
+        "rate_limits": {
+            "max_per_min": MAX_REQ_MIN,
+            "max_per_5min": MAX_REQ_5MIN,
+            "block_hours": BLOCK_HOURS,
+        },
+    })
 
-        # Rate limit check
-        rl = check_rate_limit(ip)
-        if rl:
-            self._json(429, rl)
-            return
 
-        # Route
-        if path in ("/", "/index", "/api", "/api/index"):
-            self._json(200, {
-                "success": True,
-                "message": "🚗 All-in-One API — RC Mobile + E-Challan (via Cloudflare Worker)",
-                "worker_url": CLOUDFLARE_WORKER_URL,
-                "endpoints": {
-                    "/rc4?number=MH12AB1234": "RC → Mobile number",
-                    "/challan?number=MH46BV8300": "RC → Vehicle + Challan details",
-                    "/health": "Health check",
-                },
-            })
-            return
+@app.route("/rc4", methods=["GET"])
+@rate_limit
+def rc4():
+    reg = normalize(request.args.get("number", ""))
+    if not reg:
+        return jsonify({"success": False, "error": "number required",
+                        "example": "/rc4?number=MH12AB1234"}), 400
+    if not valid_reg(reg):
+        return jsonify({"success": False, "error": "invalid RC format"}), 400
 
-        if path == "/health":
-            self._json(200, {
-                "status": "healthy",
-                "timestamp": datetime.now().isoformat(),
-                "mobile_cache_size": len(mobile_cache._d),
-                "deps": {"bs4": HAS_BS4},
-                "worker_url": CLOUDFLARE_WORKER_URL,
-            })
-            return
+    key = f"rc4|{reg}"
+    hit = mobile_cache.get(key)
+    if hit:
+        hit["cached"] = True
+        return jsonify(hit)
 
-        if path == "/rc4":
-            self._handle_rc4(qs)
-            return
-
-        if path == "/challan":
-            self._handle_challan(qs)
-            return
-
-        if path == "/challan/encrypt":
-            text = qs.get("text", [""])[0]
-            if not text:
-                self._json(400, {"error": "text required"})
-                return
-            self._json(200, {"plaintext": text, "ciphertext": aes_ecb_encrypt(text)})
-            return
-
-        if path == "/challan/decrypt":
-            text = qs.get("text", [""])[0]
-            if not text:
-                self._json(400, {"error": "text required"})
-                return
-            try:
-                self._json(200, {"ciphertext": text, "plaintext": aes_ecb_decrypt(text)})
-            except Exception as e:
-                self._json(400, {"error": str(e)})
-            return
-
-        self._json(404, {"success": False, "error": f"Unknown path: {path}"})
-
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-
-        if path == "/challan/bulk":
-            length = int(self.headers.get("content-length", "0") or 0)
-            raw = self.rfile.read(length) if length else b"{}"
-            try:
-                data = json.loads(raw)
-            except Exception:
-                self._json(400, {"error": "invalid JSON"})
-                return
-
-            numbers = data.get("numbers", [])
-            if not numbers:
-                self._json(400, {"error": "numbers array required",
-                                 "example": {"numbers": ["MH46BV8300"]}})
-                return
-            if len(numbers) > 5:
-                self._json(400, {"error": "max 5 per bulk request"})
-                return
-
-            out = []
-            for n in numbers:
-                reg = str(n).strip().upper()
-                if not reg:
-                    continue
-                r = search_vehicle(reg)
-                out.append({
-                    "reg_no": reg,
-                    "success": r["success"],
-                    "error": r.get("error"),
-                    "vehicle_details": r.get("vehicle_details"),
-                    "challan_details": r.get("challan_details"),
-                })
-            self._json(200, {"total": len(out), "results": out})
-            return
-
-        if path == "/cache/clear":
-            cache.clear()
-            mobile_cache.clear()
-            self._json(200, {"success": True, "message": "caches cleared"})
-            return
-
-        self._json(404, {"success": False, "error": f"Unknown path: {path}"})
-
-    # ---------- Handlers ----------
-    def _handle_rc4(self, qs):
-        reg = normalize(qs.get("number", [""])[0])
-        if not reg:
-            self._json(400, {"success": False, "error": "number required",
-                             "example": "/rc4?number=MH12AB1234"})
-            return
-        if not valid_reg(reg):
-            self._json(400, {"success": False, "error": "invalid RC format"})
-            return
-
-        key = f"rc4|{reg}"
-        hit = mobile_cache.get(key)
-        if hit:
-            hit["cached"] = True
-            self._json(200, hit)
-            return
-
-        t0 = time.perf_counter()
-        ch = get_chassis(reg)
-        if not ch:
-            self._json(404, {"success": False, "vehicle_number": reg,
-                             "error": "chassis not found"})
-            return
-
-        m = fetch_mobile_parivahan(reg, ch[-5:])
-        rt = round(time.perf_counter() - t0, 2)
-
-        out = {
-            "success": m.get("success", False),
+    t0 = time.perf_counter()
+    ch = get_chassis(reg)
+    if not ch:
+        return jsonify({
+            "success": False,
             "vehicle_number": reg,
-            "chassis_last_5": ch[-5:],
-            "mobile": m.get("mobile_number"),
-            "error": m.get("error"),
-            "response_time": rt,
-            "cached": False,
-        }
-        if m.get("success"):
-            mobile_cache.set(key, out, timeout=3600)
-        else:
-            mobile_cache.set(key, out, timeout=300)
-        self._json(200 if m.get("success") else 502, out)
+            "error": "chassis not found (needed for mobile lookup)",
+        }), 404
 
-    def _handle_challan(self, qs):
-        reg = qs.get("number", [""])[0].strip().upper()
+    m = fetch_mobile_parivahan(reg, ch[-5:])
+    rt = round(time.perf_counter() - t0, 2)
+
+    out = {
+        "success": m.get("success", False),
+        "vehicle_number": reg,
+        "chassis_last_5": ch[-5:],
+        "mobile": m.get("mobile_number"),
+        "error": m.get("error"),
+        "response_time": rt,
+        "cached": False,
+    }
+    if m.get("success"):
+        mobile_cache.set(key, out, timeout=3600)
+    else:
+        mobile_cache.set(key, out, timeout=300)
+    return jsonify(out), (200 if m.get("success") else 502)
+
+
+@app.route("/challan", methods=["GET"])
+@rate_limit
+def challan():
+    reg = request.args.get("number", "").strip().upper()
+    if not reg:
+        return jsonify({"success": False,
+                        "error": "number parameter required",
+                        "example": "/challan?number=MH46BV8300"}), 400
+
+    cache_key = f"challan|{reg}"
+    cached = cache.get(cache_key)
+    if cached:
+        cached["cached"] = True
+        return jsonify(cached)
+
+    t0 = time.perf_counter()
+    result = search_vehicle(reg)
+    rt = round(time.perf_counter() - t0, 2)
+
+    result["reg_no"] = reg
+    result["response_time"] = rt
+    result["cached"] = False
+
+    if result["success"]:
+        cache.set(cache_key, result, timeout=1800)
+
+    code = 200 if result["success"] else 502
+    return jsonify(result), code
+
+
+@app.route("/challan/encrypt", methods=["GET"])
+def challan_encrypt():
+    text = request.args.get("text", "")
+    if not text:
+        return jsonify({"error": "text required"}), 400
+    return jsonify({"plaintext": text, "ciphertext": aes_ecb_encrypt(text)})
+
+
+@app.route("/challan/decrypt", methods=["GET"])
+def challan_decrypt():
+    text = request.args.get("text", "")
+    if not text:
+        return jsonify({"error": "text required"}), 400
+    try:
+        return jsonify({"ciphertext": text, "plaintext": aes_ecb_decrypt(text)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/challan/bulk", methods=["POST"])
+@rate_limit
+def challan_bulk():
+    data = request.get_json() or {}
+    numbers = data.get("numbers", [])
+    if not numbers:
+        return jsonify({"error": "numbers array required",
+                        "example": {"numbers": ["MH46BV8300", "DL9C0001"]}}), 400
+    if len(numbers) > 5:
+        return jsonify({"error": "max 5 per bulk request"}), 400
+
+    out = []
+    for n in numbers:
+        reg = str(n).strip().upper()
         if not reg:
-            self._json(400, {"success": False,
-                             "error": "number parameter required",
-                             "example": "/challan?number=MH46BV8300"})
-            return
+            continue
+        r = search_vehicle(reg)
+        out.append({
+            "reg_no": reg,
+            "success": r["success"],
+            "error": r.get("error"),
+            "vehicle_details": r.get("vehicle_details"),
+            "challan_details": r.get("challan_details"),
+        })
+    return jsonify({"total": len(out), "results": out})
 
-        cache_key = f"challan|{reg}"
-        cached = cache.get(cache_key)
-        if cached:
-            cached["cached"] = True
-            self._json(200, cached)
-            return
 
-        t0 = time.perf_counter()
-        result = search_vehicle(reg)
-        rt = round(time.perf_counter() - t0, 2)
+@app.route("/cache/clear", methods=["POST"])
+def clear_cache():
+    mobile_cache.clear()
+    cache.clear()
+    return jsonify({"success": True, "message": "caches cleared"})
 
-        result["reg_no"] = reg
-        result["response_time"] = rt
-        result["cached"] = False
 
-        if result["success"]:
-            cache.set(cache_key, result, timeout=1800)
-
-        self._json(200 if result["success"] else 502, result)
-
-    # ---------- JSON helper ----------
-    def _json(self, code, obj):
-        body = json.dumps(obj).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.end_headers()
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    logger.info("=" * 60)
+    logger.info("  🚗 All-in-One API (Direct, no worker)")
+    logger.info(f"  http://0.0.0.0:{port}/")
+    logger.info("=" * 60)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
